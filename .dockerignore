@@ -1,0 +1,8 @@
+data/
+.git/
+.gitignore
+*.md
+docker-compose.yml
+dex-config.yaml
+Dockerfile
+.dockerignore
