@@ -9,7 +9,7 @@ To run the pre-built container use
 ```bash
 mkdir data
 
-docker run --rm -t -v $PWD/data:/data:ro \
+docker run --rm -t -v $PWD/data:/app/data:ro \
   -p 8080:8080 ghcr.io/siderolabs/talos-remote-config:latest
 ```
 

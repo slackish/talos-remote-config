@@ -36,6 +36,7 @@ func main() {
 	}
 
 	http.HandleFunc("/metadata", metadataHandler)
+	http.HandleFunc("/", notFoundHandler)
 
 	addr := fmt.Sprintf(":%s", *port)
 	log.Printf("Starting server on %s, data directory: %s", addr, *dataDir)
@@ -43,6 +44,20 @@ func main() {
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func notFoundHandler(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	var paramLog []string
+	for key, values := range query {
+		for _, value := range values {
+			paramLog = append(paramLog, fmt.Sprintf("%s=%s", key, value))
+		}
+	}
+
+	log.Printf("Request: method=%s remote=%s path=%s params=[%s] user_agent=%q - 404 not found",
+		r.Method, r.RemoteAddr, r.URL.Path, strings.Join(paramLog, ", "), r.Header.Get("User-Agent"))
+	http.NotFound(w, r)
 }
 
 func metadataHandler(w http.ResponseWriter, r *http.Request) {

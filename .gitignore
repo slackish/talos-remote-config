@@ -16,3 +16,4 @@ remote-config
 go.work
 
 .claude/*
+_out/*
