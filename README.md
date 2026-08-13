@@ -81,6 +81,60 @@ The service returns the first match found.
 - `-port`: Port to listen on (default: `8080`)
 - `-default-config`: Default configuration for unmatched requests
 - `-common-config`: Configuration to combine with every request
+- `-ip-acl-enabled`: Enable IP-based access control (default: `false`)
+- `-ip-acl-config`: Path to IP-to-metadata mapping YAML file (required when `-ip-acl-enabled=true`)
+- `-ip-acl-forwarded`: HTTP header name to resolve client IP (e.g., `X-Forwarded-For`; empty means use socket address)
+
+## IP-based Authentication
+
+When enabled, the service validates that incoming requests originate from known IP addresses and that the metadata parameters sent by each request match what is expected for that IP. This prevents unauthorized nodes from requesting another node's configuration.
+
+### Enabling
+
+```bash
+docker run --rm -t -v $PWD/data:/app/data:ro \
+  -v $PWD/ip-map.yaml:/app/ip-map.yaml:ro \
+  -p 8080:8080 ghcr.io/siderolabs/talos-remote-config:latest \
+  -ip-acl-enabled=true -ip-acl-config /app/ip-map.yaml
+```
+
+### Mapping File Format
+
+The mapping file is a YAML file that maps IP addresses to their expected metadata values. Values are stored in normalized form (colons replaced with hyphens, lowercase). Only the parameters defined for an IP will be validated; additional parameters sent by the client are ignored.
+
+```yaml
+# /etc/talos/ip-map.yaml
+10.0.1.5:
+  h: web-01
+  m: aa-bb-cc-dd-ee-ff
+  s: SN001
+10.0.2.3:
+  u: 550e8400-e29b-41d4-a716-446655440000
+10.0.3.7:
+  h: worker-01
+  m: 11-22-33-44-55-66
+```
+
+### Validation Rules
+
+- **Unknown IP** (not in mapping): Returns `401 Unauthorized`
+- **Known IP, parameter value mismatch**: Returns `403 Forbidden`
+- **Known IP, no recognized parameters**: Returns `403 Forbidden`
+- **Partial identity**: If the mapping defines `h`, `m`, and `s` but the client only sends `?m=...`, authentication passes and config is served for the MAC parameter only
+
+### Reverse Proxy Support
+
+When behind a reverse proxy or load balancer, configure the header that carries the original client IP:
+
+```bash
+-ip-acl-enabled=true -ip-acl-config /app/ip-map.yaml -ip-acl-forwarded "X-Forwarded-For"
+```
+
+The service reads the first entry from the specified header (for chained proxies) and falls back to the socket address if the header is not present.
+
+### Hot-reload
+
+The mapping file is watched for changes at runtime. When the file is modified, it is automatically reloaded. If a malformed file replaces a valid one, all requests will receive `401` until a valid mapping is restored.
 
 ## API
 
@@ -159,6 +213,8 @@ data/
 
 ## Error Handling
 
+- Returns `401 Unauthorized` when IP-based authentication is enabled and the source IP is not in the mapping file
+- Returns `403 Forbidden` when IP-based authentication is enabled but parameter validation fails (mismatch or no recognized parameters)
 - Returns `404 Not Found` if no matching files are found
 - Returns `500 Internal Server Error` if YAML validation fails
 - Logs errors for individual file read failures but continues processing other files

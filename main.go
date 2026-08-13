@@ -4,11 +4,16 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"gopkg.in/yaml.v3"
 )
 
@@ -20,7 +25,82 @@ var (
 	port          = flag.String("port", "8080", "Port to listen on")
 	commonConfig  = flag.String("common-config", "", "Path to common configuration file (applied to every request)")
 	defaultConfig = flag.String("default-config", "", "Path to default configuration file (returned for unmatched requests)")
+
+	ipACLEnabled    = flag.Bool("ip-acl-enabled", false, "Enable IP-based access control")
+	ipACLConfig     = flag.String("ip-acl-config", "", "Path to IP-to-metadata mapping YAML file")
+	ipACLForwarded  = flag.String("ip-acl-forwarded", "", "HTTP header name to resolve client IP (e.g., X-Forwarded-For)")
 )
+
+var (
+	ipACLMapping atomic.Pointer[map[string]map[string]string]
+)
+
+func clientIP(r *http.Request, headerName string) string {
+	if headerName != "" {
+		val := r.Header.Get(headerName)
+		if val != "" {
+			ip := strings.Split(val, ",")[0]
+			return strings.TrimSpace(ip)
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func loadIPMapping(path string) (map[string]map[string]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read mapping file: %w", err)
+	}
+	var result map[string]map[string]string
+	if err := yaml.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("parse mapping file: %w", err)
+	}
+	return result, nil
+}
+
+func startMappingWatcher(path string) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatalf("Failed to create fsnotify watcher for %s: %v", path, err)
+	}
+
+	go func() {
+		defer watcher.Close()
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove) != 0 {
+					// Small delay to allow multiple rapid events to coalesce
+					time.Sleep(50 * time.Millisecond)
+					mapping, err := loadIPMapping(path)
+					if err != nil {
+						log.Printf("IP ACL: failed to reload mapping file %s: %v", path, err)
+						ipACLMapping.Store(nil)
+					} else {
+						log.Printf("IP ACL: mapping file reloaded (%d entries)", len(mapping))
+						ipACLMapping.Store(&mapping)
+					}
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Printf("IP ACL: watcher error: %v", err)
+			}
+		}
+	}()
+
+	if err := watcher.Add(path); err != nil {
+		log.Fatalf("Failed to watch mapping file %s: %v", path, err)
+	}
+}
 
 func main() {
 	flag.Parse()
@@ -33,6 +113,22 @@ func main() {
 	}
 	if *defaultConfig == "" {
 		*defaultConfig = filepath.Join(*dataDir, "default.yaml")
+	}
+
+	// Load IP ACL mapping if enabled
+	if *ipACLEnabled {
+		if *ipACLConfig == "" {
+			log.Fatal("IP ACL enabled but -ip-acl-config is not specified")
+		}
+		mapping, err := loadIPMapping(*ipACLConfig)
+		if err != nil {
+			log.Fatalf("Failed to load IP ACL mapping file %s: %v", *ipACLConfig, err)
+		}
+		ipACLMapping.Store(&mapping)
+		log.Printf("IP ACL: loaded mapping file %s (%d entries)", *ipACLConfig, len(mapping))
+
+		// Start hot-reload watcher
+		startMappingWatcher(*ipACLConfig)
 	}
 
 	http.HandleFunc("/metadata", metadataHandler)
@@ -78,6 +174,28 @@ func metadataHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Request: method=%s remote=%s path=%s params=[%s] user_agent=%q forwarded_user=%q forwarded_for=%q",
 		r.Method, r.RemoteAddr, r.URL.Path, strings.Join(paramLog, ", "), userAgent, forwardedUser, forwardedFor)
+
+	// IP ACL authentication check
+	if *ipACLEnabled {
+		mapping := ipACLMapping.Load()
+		if mapping == nil || len(*mapping) == 0 {
+			log.Printf("Auth DENIED: IP ACL enabled but no valid mapping loaded")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		ip := clientIP(r, *ipACLForwarded)
+		ok, reason := validateAuth(query, *mapping, ip)
+		if !ok {
+			log.Printf("Auth DENIED: %s", reason)
+			if strings.HasPrefix(reason, "unknown IP") {
+				w.WriteHeader(http.StatusUnauthorized)
+			} else {
+				w.WriteHeader(http.StatusForbidden)
+			}
+			return
+		}
+		log.Printf("Auth ALLOWED: IP %s validated", ip)
+	}
 
 	var allContent [][]byte
 	var foundQueryMatches bool
@@ -319,4 +437,40 @@ func normalizeValue(value string) string {
 	// Convert to lowercase for consistency
 	value = strings.ToLower(value)
 	return value
+}
+
+// validateAuth validates query parameters against the IP ACL mapping.
+// Returns (true, "") if auth passes, or (false, reason) if it fails.
+// Unknown params (not in mapping) are skipped; only known params are validated.
+func validateAuth(query url.Values, mapping map[string]map[string]string, ip string) (bool, string) {
+	expectedParams, ok := mapping[ip]
+	if !ok {
+		return false, fmt.Sprintf("unknown IP %s", ip)
+	}
+
+	var recognizedCount int
+	for paramName, values := range query {
+		if len(values) == 0 || values[0] == "" {
+			continue
+		}
+		paramValue := values[0]
+
+		expectedValue, defined := expectedParams[paramName]
+		if !defined {
+			// Unknown params are skipped (ignored by handler anyway)
+			continue
+		}
+
+		if normalizeValue(paramValue) != normalizeValue(expectedValue) {
+			return false, fmt.Sprintf("param '%s' mismatch for IP %s", paramName, ip)
+		}
+
+		recognizedCount++
+	}
+
+	if recognizedCount == 0 {
+		return false, fmt.Sprintf("no recognized parameters for IP %s", ip)
+	}
+
+	return true, ""
 }
